@@ -1,0 +1,646 @@
+// nevada - by werty129129
+// C++17 / Win32. Функционал bhop/trigger сохранён. Добавлены темы и конфиги.
+#define NOMINMAX
+#include <windows.h>
+#include <windowsx.h>
+#include <string>
+#include <algorithm>
+#include <thread>
+#include <atomic>
+#include <cwchar>
+#include <cstdio>
+#include <vector>
+#include <cmath>
+
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(linker, "/ENTRY:wWinMainCRTStartup")
+
+// ==================== ГЛОБАЛЬНЫЕ НАСТРОЙКИ ====================
+struct Settings {
+    std::wstring bhopKey = L"XButton1";
+    int          bhopDelay = 15;
+    std::wstring triggerKey = L"X";
+    std::wstring shootKey = L"LButton";
+    int          threshold = 20;
+    int          shootDelay = 1;
+    std::wstring theme = L"Dark";
+} g;
+
+static const wchar_t* kIni = L"Nevada.ini";
+static const wchar_t* kClassName = L"NevadaXWindow";
+static const wchar_t* kInputClass = L"NevadaXInputBox";
+static HWND  g_hwnd = nullptr;
+static HFONT g_fontTitle = nullptr, g_font = nullptr, g_fontSmall = nullptr;
+static UINT_PTR g_uiTimer = 1;
+static UINT_PTR g_bhopTimer = 2;
+
+// ==================== ТЕМЫ ====================
+struct Theme {
+    const wchar_t* name;
+    COLORREF bg, panel, panelEdge, accent;
+    COLORREF textHi, textNorm, textDim;
+    COLORREF btnBg, btnBgActive, btnEdge;
+    bool     rainbow;
+    bool     transparent;
+};
+
+static const Theme kThemes[] = {
+    { L"Dark",   RGB(14,15,22),  RGB(22,24,34),  RGB(44,47,62),  RGB(100,130,255), RGB(245,247,255), RGB(218,222,240), RGB(165,171,192), RGB(27,29,40), RGB(35,39,54), RGB(57,61,78),  false, false },
+    { L"Ocean",  RGB(8,20,30),   RGB(14,34,48),  RGB(30,70,90),  RGB(0,190,220),   RGB(230,250,255), RGB(180,225,240), RGB(120,170,190), RGB(18,44,60), RGB(28,64,84), RGB(40,90,110), false, false },
+    { L"Blood",  RGB(18,8,8),    RGB(30,14,14),  RGB(70,24,24),  RGB(230,60,60),   RGB(255,240,240), RGB(240,200,200), RGB(190,140,140), RGB(40,18,18), RGB(58,26,26), RGB(90,34,34),  false, false },
+    { L"Matrix", RGB(4,12,4),    RGB(10,24,10),  RGB(24,60,24),  RGB(60,220,60),   RGB(220,255,220), RGB(180,240,180), RGB(110,180,110), RGB(14,34,14), RGB(22,48,22), RGB(34,80,34),  false, false },
+    { L"Rainbow",RGB(20,20,30),  RGB(30,30,45),  RGB(60,60,90),  RGB(255,0,128),   RGB(255,255,255), RGB(230,230,255), RGB(170,170,200), RGB(30,30,45), RGB(45,45,65), RGB(80,80,120), true,  false },
+    { L"Light",  RGB(245,246,250), RGB(255,255,255), RGB(200,204,220), RGB(80,110,230), RGB(25,28,40), RGB(50,55,75), RGB(120,126,150), RGB(235,237,245), RGB(220,225,240), RGB(190,195,215), false, false },
+    { L"Ghost",  RGB(30,30,40),  RGB(40,40,55),  RGB(70,70,95),  RGB(180,180,255), RGB(240,240,255), RGB(210,210,235), RGB(150,150,180), RGB(45,45,60), RGB(60,60,80), RGB(90,90,120), false, true },
+};
+static const int kThemeCount = (int)(sizeof(kThemes) / sizeof(kThemes[0]));
+static const Theme* g_theme = &kThemes[0];
+
+static COLORREF g_rainbowAccent = RGB(255,0,128);
+static double   g_rainbowPhase = 0.0;
+
+static COLORREF HsvToRgb(double h, double s, double v) {
+    double r=0,g=0,b=0;
+    h = fmod(h, 360.0); if (h < 0) h += 360.0;
+    int i = (int)(h / 60.0) % 6;
+    double f = h / 60.0 - floor(h / 60.0);
+    double p = v * (1 - s), q = v * (1 - s*f), t = v * (1 - s*(1-f));
+    switch (i) {
+    case 0: r=v; g=t; b=p; break;
+    case 1: r=q; g=v; b=p; break;
+    case 2: r=p; g=v; b=t; break;
+    case 3: r=p; g=q; b=v; break;
+    case 4: r=t; g=p; b=v; break;
+    default:r=v; g=p; b=q; break;
+    }
+    return RGB((int)(r*255),(int)(g*255),(int)(b*255));
+}
+
+static void UpdateRainbow() {
+    if (!g_theme->rainbow) { g_rainbowAccent = g_theme->accent; return; }
+    g_rainbowPhase += 1.5;
+    if (g_rainbowPhase > 360.0) g_rainbowPhase -= 360.0;
+    g_rainbowAccent = HsvToRgb(g_rainbowPhase, 0.75, 1.0);
+}
+
+static COLORREF CurrentAccent() {
+    return g_theme->rainbow ? g_rainbowAccent : g_theme->accent;
+}
+
+static void ApplyTheme(const std::wstring& name) {
+    for (int i = 0; i < kThemeCount; ++i) {
+        if (_wcsicmp(kThemes[i].name, name.c_str()) == 0) { g_theme = &kThemes[i]; break; }
+    }
+    if (g_hwnd) {
+        LONG_PTR ex = GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE);
+        if (g_theme->transparent) {
+            SetWindowLongPtrW(g_hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+            SetLayeredWindowAttributes(g_hwnd, 0, 235, LWA_ALPHA);
+        } else {
+            SetWindowLongPtrW(g_hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
+        }
+    }
+}
+static const Theme* NextTheme(const std::wstring& cur) {
+    for (int i = 0; i < kThemeCount; ++i) {
+        if (_wcsicmp(kThemes[i].name, cur.c_str()) == 0) return &kThemes[(i + 1) % kThemeCount];
+    }
+    return &kThemes[0];
+}
+
+// ==================== СОСТОЯНИЕ ====================
+static HHOOK g_kbHook = nullptr;
+static HHOOK g_mouseHook = nullptr;
+static std::atomic<bool> g_bhopHeld{ false };
+static std::atomic<bool> g_triggerHeld{ false };
+static std::atomic<bool> g_triggerRunning{ false };
+static std::atomic<bool> g_shutdown{ false };
+static std::thread g_triggerThread;
+
+// ==================== INI ====================
+static std::wstring IniGet(const wchar_t* sec, const wchar_t* key, const wchar_t* def, const wchar_t* file = kIni) {
+    wchar_t buf[512]{};
+    GetPrivateProfileStringW(sec, key, def, buf, 512, file);
+    return buf;
+}
+static int IniGetInt(const wchar_t* sec, const wchar_t* key, int def, const wchar_t* file = kIni) {
+    return (int)GetPrivateProfileIntW(sec, key, def, file);
+}
+static void IniSet(const wchar_t* sec, const wchar_t* key, const std::wstring& v, const wchar_t* file = kIni) {
+    WritePrivateProfileStringW(sec, key, v.c_str(), file);
+}
+static void IniSetInt(const wchar_t* sec, const wchar_t* key, int v, const wchar_t* file = kIni) {
+    IniSet(sec, key, std::to_wstring(v), file);
+}
+
+static void LoadSettings() {
+    g.bhopKey = IniGet(L"Bhop", L"Key", L"XButton1");
+    g.bhopDelay = std::clamp(IniGetInt(L"Bhop", L"Delay", 15), 1, 100);
+    g.triggerKey = IniGet(L"Trigger", L"Key", L"X");
+    g.shootKey = IniGet(L"Trigger", L"ShootKey", L"LButton");
+    g.threshold = std::clamp(IniGetInt(L"Trigger", L"Threshold", 20), 0, 255);
+    g.shootDelay = std::clamp(IniGetInt(L"Trigger", L"ShootDelay", 1), 1, 500);
+    g.theme = IniGet(L"Theme", L"Name", L"Dark");
+    ApplyTheme(g.theme);
+}
+static void SaveSettings(const wchar_t* file = kIni) {
+    IniSet(L"Bhop", L"Key", g.bhopKey, file);
+    IniSetInt(L"Bhop", L"Delay", g.bhopDelay, file);
+    IniSet(L"Trigger", L"Key", g.triggerKey, file);
+    IniSet(L"Trigger", L"ShootKey", g.shootKey, file);
+    IniSetInt(L"Trigger", L"Threshold", g.threshold, file);
+    IniSetInt(L"Trigger", L"ShootDelay", g.shootDelay, file);
+    IniSet(L"Theme", L"Name", g.theme, file);
+}
+static void SaveDefaultsIfMissing() {
+    if (GetFileAttributesW(kIni) == INVALID_FILE_ATTRIBUTES) SaveSettings();
+}
+
+// ==================== КЛАВИШИ ====================
+struct KeyEntry { const wchar_t* name; WORD vk; bool mouse; WORD mouseFlag; };
+static const KeyEntry kKeys[] = {
+    { L"A", 'A' },{ L"B", 'B' },{ L"C", 'C' },{ L"D", 'D' },{ L"E", 'E' },{ L"F", 'F' },
+    { L"G", 'G' },{ L"H", 'H' },{ L"I", 'I' },{ L"J", 'J' },{ L"K", 'K' },{ L"L", 'L' },
+    { L"M", 'M' },{ L"N", 'N' },{ L"O", 'O' },{ L"P", 'P' },{ L"Q", 'Q' },{ L"R", 'R' },
+    { L"S", 'S' },{ L"T", 'T' },{ L"U", 'U' },{ L"V", 'V' },{ L"W", 'W' },{ L"X", 'X' },
+    { L"Y", 'Y' },{ L"Z", 'Z' },
+    { L"0", '0' },{ L"1", '1' },{ L"2", '2' },{ L"3", '3' },{ L"4", '4' },
+    { L"5", '5' },{ L"6", '6' },{ L"7", '7' },{ L"8", '8' },{ L"9", '9' },
+    { L"Space", VK_SPACE },{ L"Shift", VK_SHIFT },{ L"Ctrl", VK_CONTROL },{ L"Alt", VK_MENU },
+    { L"Tab", VK_TAB },{ L"Enter", VK_RETURN },{ L"Esc", VK_ESCAPE },{ L"Backspace", VK_BACK },
+    { L"LButton", 0, true, RI_MOUSE_LEFT_BUTTON_DOWN },
+    { L"RButton", 0, true, RI_MOUSE_RIGHT_BUTTON_DOWN },
+    { L"MButton", 0, true, RI_MOUSE_MIDDLE_BUTTON_DOWN },
+    { L"XButton1",0, true, RI_MOUSE_BUTTON_4_DOWN },
+    { L"XButton2",0, true, RI_MOUSE_BUTTON_5_DOWN },
+};
+static const KeyEntry* FindKey(const std::wstring& n) {
+    for (const auto& k : kKeys) if (_wcsicmp(k.name, n.c_str()) == 0) return &k;
+    return nullptr;
+}
+
+// ==================== ВВОД ====================
+static void SendKeyTap(WORD vk) {
+    INPUT in[2]{};
+    in[0].type = INPUT_KEYBOARD; in[0].ki.wVk = vk;
+    in[1] = in[0]; in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, in, sizeof(INPUT));
+}
+static void SendMouseButton(WORD flag) {
+    INPUT in[2]{};
+    in[0].type = INPUT_MOUSE; in[1].type = INPUT_MOUSE;
+    if (flag == RI_MOUSE_LEFT_BUTTON_DOWN) {
+        in[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN; in[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    }
+    else if (flag == RI_MOUSE_RIGHT_BUTTON_DOWN) {
+        in[0].mi.dwFlags = MOUSEEVENTF_RIGHTDOWN; in[1].mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+    }
+    else if (flag == RI_MOUSE_MIDDLE_BUTTON_DOWN) {
+        in[0].mi.dwFlags = MOUSEEVENTF_MIDDLEDOWN; in[1].mi.dwFlags = MOUSEEVENTF_MIDDLEUP;
+    }
+    else {
+        in[0].mi.dwFlags = MOUSEEVENTF_XDOWN; in[1].mi.dwFlags = MOUSEEVENTF_XUP;
+        in[0].mi.mouseData = in[1].mi.mouseData =
+            (flag == RI_MOUSE_BUTTON_4_DOWN) ? XBUTTON1 : XBUTTON2;
+    }
+    SendInput(2, in, sizeof(INPUT));
+}
+static void TapShoot() {
+    if (auto* k = FindKey(g.shootKey)) {
+        if (k->mouse) SendMouseButton(k->mouseFlag);
+        else          SendKeyTap(k->vk);
+    }
+}
+
+// ==================== ТРИГГЕР ====================
+static void TriggerWorker() {
+    while (!g_shutdown) {
+        while (!g_triggerRunning && !g_shutdown) Sleep(5);
+        if (g_shutdown) break;
+
+        POINT pt{};
+        if (!GetCursorPos(&pt)) { g_triggerRunning = false; continue; }
+        HDC dc = GetDC(nullptr);
+        COLORREF base = GetPixel(dc, pt.x + 2, pt.y + 2);
+        ReleaseDC(nullptr, dc);
+        if (base == CLR_INVALID) { g_triggerRunning = false; continue; }
+
+        int r1 = GetRValue(base), g1 = GetGValue(base), b1 = GetBValue(base);
+
+        while (g_triggerRunning && !g_shutdown) {
+            Sleep(g.shootDelay);
+            if (!GetCursorPos(&pt)) break;
+            HDC d2 = GetDC(nullptr);
+            COLORREF c2 = GetPixel(d2, pt.x + 2, pt.y + 2);
+            ReleaseDC(nullptr, d2);
+            if (c2 == CLR_INVALID) continue;
+            int r2 = GetRValue(c2), g2 = GetGValue(c2), b2 = GetBValue(c2);
+            int t = g.threshold;
+            if (abs(r1 - r2) > t || abs(g1 - g2) > t || abs(b1 - b2) > t) {
+                TapShoot();
+            }
+        }
+    }
+}
+
+// ==================== ХУКИ ====================
+static bool NameIsKeyboard(const std::wstring& n, DWORD vk) {
+    auto* k = FindKey(n);
+    return k && !k->mouse && k->vk == vk;
+}
+static void OnKeyDownForTrigger() { if (!g_triggerHeld.exchange(true)) g_triggerRunning = true; }
+static void OnKeyUpForTrigger()   { if (g_triggerHeld.exchange(false)) g_triggerRunning = false; }
+static void OnKeyDownForBhop()    { if (!g_bhopHeld.exchange(true)) SetTimer(g_hwnd, g_bhopTimer, g.bhopDelay, nullptr); }
+static void OnKeyUpForBhop()      { if (g_bhopHeld.exchange(false)) KillTimer(g_hwnd, g_bhopTimer); }
+
+static LRESULT CALLBACK KbProc(int nCode, WPARAM wp, LPARAM lp) {
+    if (nCode == HC_ACTION) {
+        auto* kb = (KBDLLHOOKSTRUCT*)lp;
+        bool isDown = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
+        bool isUp = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
+        if (NameIsKeyboard(g.bhopKey, kb->vkCode)) {
+            if (isDown) OnKeyDownForBhop(); else if (isUp) OnKeyUpForBhop();
+        }
+        if (NameIsKeyboard(g.triggerKey, kb->vkCode)) {
+            if (isDown) OnKeyDownForTrigger(); else if (isUp) OnKeyUpForTrigger();
+        }
+    }
+    return CallNextHookEx(g_kbHook, nCode, wp, lp);
+}
+static bool MouseMatches(const std::wstring& name, WPARAM wp, DWORD mouseData) {
+    auto* k = FindKey(name);
+    if (!k || !k->mouse) return false;
+    if (k->mouseFlag == RI_MOUSE_LEFT_BUTTON_DOWN)
+        return wp == WM_LBUTTONDOWN || wp == WM_LBUTTONUP;
+    if (k->mouseFlag == RI_MOUSE_RIGHT_BUTTON_DOWN)
+        return wp == WM_RBUTTONDOWN || wp == WM_RBUTTONUP;
+    if (k->mouseFlag == RI_MOUSE_MIDDLE_BUTTON_DOWN)
+        return wp == WM_MBUTTONDOWN || wp == WM_MBUTTONUP;
+    WORD xb = HIWORD(mouseData);
+    return ((k->mouseFlag == RI_MOUSE_BUTTON_4_DOWN && xb == XBUTTON1) ||
+        (k->mouseFlag == RI_MOUSE_BUTTON_5_DOWN && xb == XBUTTON2));
+}
+static LRESULT CALLBACK MouseProc(int nCode, WPARAM wp, LPARAM lp) {
+    if (nCode == HC_ACTION) {
+        auto* ms = (MSLLHOOKSTRUCT*)lp;
+        bool isDown = (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN || wp == WM_XBUTTONDOWN);
+        bool isUp = (wp == WM_LBUTTONUP || wp == WM_RBUTTONUP || wp == WM_MBUTTONUP || wp == WM_XBUTTONUP);
+        if (MouseMatches(g.bhopKey, wp, ms->mouseData)) {
+            if (isDown) OnKeyDownForBhop(); else if (isUp) OnKeyUpForBhop();
+        }
+        if (MouseMatches(g.triggerKey, wp, ms->mouseData)) {
+            if (isDown) OnKeyDownForTrigger(); else if (isUp) OnKeyUpForTrigger();
+        }
+    }
+    return CallNextHookEx(g_mouseHook, nCode, wp, lp);
+}
+static void InstallHooks() {
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, KbProc, inst, 0);
+    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, inst, 0);
+    g_triggerThread = std::thread(TriggerWorker);
+}
+static void UninstallHooks() {
+    if (g_kbHook) { UnhookWindowsHookEx(g_kbHook);    g_kbHook = nullptr; }
+    if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
+    KillTimer(g_hwnd, g_bhopTimer);
+    g_bhopHeld = false;
+    g_triggerRunning = false;
+    g_triggerHeld = false;
+    g_shutdown = true;
+    if (g_triggerThread.joinable()) g_triggerThread.join();
+}
+
+// ==================== InputBox ====================
+struct InputBoxData { std::wstring result; bool ok = false; HWND edit = nullptr; };
+static LRESULT CALLBACK InputBoxProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    auto* d = (InputBoxData*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (m) {
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK) {
+            wchar_t buf[256]{}; GetDlgItemTextW(h, 101, buf, 256);
+            d->result = buf; d->ok = true; DestroyWindow(h);
+        }
+        else if (LOWORD(wp) == IDCANCEL) DestroyWindow(h);
+        return 0;
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+static bool ShowInputBox(HWND owner, const wchar_t* title, const wchar_t* prompt,
+    const std::wstring& initial, std::wstring& out) {
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = InputBoxProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = kInputClass;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        RegisterClassW(&wc); reg = true;
+    }
+    InputBoxData d;
+    HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, kInputClass, title,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 340, 175, owner, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)&d);
+    CreateWindowW(L"STATIC", prompt, WS_CHILD | WS_VISIBLE, 15, 15, 310, 40, h, nullptr, nullptr, nullptr);
+    d.edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", initial.c_str(),
+        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 15, 55, 310, 24, h, (HMENU)101, nullptr, nullptr);
+    CreateWindowW(L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+        165, 100, 75, 28, h, (HMENU)IDOK, nullptr, nullptr);
+    CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE,
+        250, 100, 75, 28, h, (HMENU)IDCANCEL, nullptr, nullptr);
+    SendMessageW(d.edit, EM_SETSEL, 0, -1);
+    SetFocus(d.edit);
+    EnableWindow(owner, FALSE);
+    MSG msg{};
+    while (IsWindow(h) && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) { DestroyWindow(h); break; }
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN && GetFocus() == d.edit) {
+            SendMessageW(h, WM_COMMAND, IDOK, 0); continue;
+        }
+        TranslateMessage(&msg); DispatchMessageW(&msg);
+    }
+    EnableWindow(owner, TRUE); SetActiveWindow(owner);
+    if (d.ok) out = d.result;
+    return d.ok;
+}
+
+// ==================== UI ====================
+static void SetFont(HDC dc, HFONT f) { SelectObject(dc, f); }
+static void Text(HDC dc, int x, int y, const wchar_t* s, COLORREF c, HFONT f) {
+    SetBkMode(dc, TRANSPARENT); SetTextColor(dc, c); SetFont(dc, f);
+    TextOutW(dc, x, y, s, (int)wcslen(s));
+}
+static void RoundedPanel(HDC dc, RECT r, COLORREF fill, COLORREF edge) {
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN pen = CreatePen(PS_SOLID, 1, edge);
+    auto ob = SelectObject(dc, br), op = SelectObject(dc, pen);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, 10, 10);
+    SelectObject(dc, ob); SelectObject(dc, op);
+    DeleteObject(br); DeleteObject(pen);
+}
+static void DrawButton(HDC dc, RECT r, const wchar_t* label, bool active) {
+    RoundedPanel(dc, r, active ? g_theme->btnBgActive : g_theme->btnBg,
+        active ? CurrentAccent() : g_theme->btnEdge);
+    Text(dc, r.left + 12, r.top + 7, label,
+        active ? g_theme->textHi : g_theme->textNorm, g_fontSmall);
+}
+
+static void DrawUI(HDC dc, RECT client) {
+    UpdateRainbow();
+    COLORREF accent = CurrentAccent();
+
+    HBRUSH bg = CreateSolidBrush(g_theme->bg);
+    FillRect(dc, &client, bg); DeleteObject(bg);
+
+    HPEN pen = CreatePen(PS_SOLID, 2, accent);
+    auto op = SelectObject(dc, pen);
+    auto ob = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+    RoundRect(dc, 7, 7, 393, 333, 15, 15);
+    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(pen);
+
+    Text(dc, 22, 15, L"NEVADA", g_theme->textHi, g_fontTitle);
+    Text(dc, 24, 41, L"by werty129129  |  M E N U   S E T T I N G S", g_theme->textDim, g_fontSmall);
+    DrawButton(dc, RECT{ 300,16,382,40 }, g_theme->name, false);
+
+    RoundedPanel(dc, RECT{ 18,60,382,143 }, g_theme->panel, g_theme->panelEdge);
+    Text(dc, 30, 71, L"MOVEMENT", g_theme->textNorm, g_fontSmall);
+    Text(dc, 30, 98, L"BHop delay", g_theme->textDim, g_fontSmall);
+    auto delay = std::to_wstring(g.bhopDelay) + L" ms";
+    Text(dc, 285, 98, delay.c_str(), g_theme->textHi, g_fontSmall);
+    DrawButton(dc, RECT{ 30,116,74,138 }, L"-", false);
+    DrawButton(dc, RECT{ 80,116,124,138 }, L"+", false);
+    Text(dc, 154, 121, L"BHop key", g_theme->textDim, g_fontSmall);
+    DrawButton(dc, RECT{ 246,114,365,139 }, g.bhopKey.c_str(), false);
+
+    RoundedPanel(dc, RECT{ 18,153,382,232 }, g_theme->panel, g_theme->panelEdge);
+    Text(dc, 30, 163, L"TRIGGER SETTINGS", g_theme->textNorm, g_fontSmall);
+    Text(dc, 30, 188, L"Threshold", g_theme->textDim, g_fontSmall);
+    auto thr = std::to_wstring(g.threshold);
+    Text(dc, 120, 188, thr.c_str(), g_theme->textHi, g_fontSmall);
+    DrawButton(dc, RECT{ 163,182,207,205 }, L"-", false);
+    DrawButton(dc, RECT{ 213,182,257,205 }, L"+", false);
+    Text(dc, 30, 211, L"Trigger key", g_theme->textDim, g_fontSmall);
+    DrawButton(dc, RECT{ 246,206,365,228 }, g.triggerKey.c_str(), false);
+
+    RoundedPanel(dc, RECT{ 18,242,382,300 }, g_theme->panel, g_theme->panelEdge);
+    Text(dc, 30, 250, L"CONFIG  (click to edit)", g_theme->textNorm, g_fontSmall);
+    DrawButton(dc, RECT{ 30,268,104,290 }, L"SAVE", false);
+    DrawButton(dc, RECT{ 112,268,186,290 }, L"LOAD", false);
+    DrawButton(dc, RECT{ 194,268,268,290 }, L"DEL", false);
+
+    Text(dc, 30, 310, L"Shoot:", g_theme->textDim, g_fontSmall);
+    Text(dc, 82, 310, g.shootKey.c_str(), g_theme->textHi, g_fontSmall);
+    auto sd = std::to_wstring(g.shootDelay) + L" ms";
+    Text(dc, 190, 310, L"Delay:", g_theme->textDim, g_fontSmall);
+    Text(dc, 236, 310, sd.c_str(), g_theme->textHi, g_fontSmall);
+}
+
+// ==================== ДИАЛОГИ ====================
+static void ChangeBhopKey() {
+    std::wstring v;
+    if (ShowInputBox(g_hwnd, L"nevada - by werty129129",
+        L"Enter new BHop key (X, XButton1, Space, LButton, F):", g.bhopKey, v) && !v.empty()) {
+        g.bhopKey = v; IniSet(L"Bhop", L"Key", v);
+        InvalidateRect(g_hwnd, nullptr, TRUE);
+    }
+}
+static void ChangeBhopDelay() {
+    std::wstring v;
+    if (ShowInputBox(g_hwnd, L"nevada - by werty129129", L"Enter BHop delay (1-100 ms):",
+        std::to_wstring(g.bhopDelay), v)) {
+        try {
+            int n = std::stoi(v);
+            if (n >= 1 && n <= 100) {
+                g.bhopDelay = n; IniSetInt(L"Bhop", L"Delay", n);
+                if (g_bhopHeld) SetTimer(g_hwnd, g_bhopTimer, g.bhopDelay, nullptr);
+                InvalidateRect(g_hwnd, nullptr, TRUE);
+            }
+        }
+        catch (...) {}
+    }
+}
+static void ChangeTriggerKey() {
+    std::wstring v;
+    if (ShowInputBox(g_hwnd, L"nevada - by werty129129",
+        L"Enter new Trigger key (X, LButton, RButton, F):", g.triggerKey, v) && !v.empty()) {
+        g.triggerKey = v; IniSet(L"Trigger", L"Key", v);
+        InvalidateRect(g_hwnd, nullptr, TRUE);
+    }
+}
+static void ChangeThreshold() {
+    std::wstring v;
+    if (ShowInputBox(g_hwnd, L"nevada - by werty129129", L"Enter threshold (0-255):",
+        std::to_wstring(g.threshold), v)) {
+        try {
+            int n = std::stoi(v);
+            if (n >= 0 && n <= 255) {
+                g.threshold = n; IniSetInt(L"Trigger", L"Threshold", n);
+                InvalidateRect(g_hwnd, nullptr, TRUE);
+            }
+        }
+        catch (...) {}
+    }
+}
+static void ChangeShootKey() {
+    std::wstring v;
+    if (ShowInputBox(g_hwnd, L"nevada - by werty129129",
+        L"Enter new Shoot key (LButton, RButton, MButton):", g.shootKey, v) && !v.empty()) {
+        g.shootKey = v; IniSet(L"Trigger", L"ShootKey", v);
+        InvalidateRect(g_hwnd, nullptr, TRUE);
+    }
+}
+static void ChangeShootDelay() {
+    std::wstring v;
+    if (ShowInputBox(g_hwnd, L"nevada - by werty129129", L"Enter shoot delay (1-500 ms):",
+        std::to_wstring(g.shootDelay), v)) {
+        try {
+            int n = std::stoi(v);
+            if (n >= 1 && n <= 500) {
+                g.shootDelay = n; IniSetInt(L"Trigger", L"ShootDelay", n);
+                InvalidateRect(g_hwnd, nullptr, TRUE);
+            }
+        }
+        catch (...) {}
+    }
+}
+
+// ==================== КОНФИГИ ====================
+static std::wstring ConfigPath(const std::wstring& name) {
+    wchar_t exe[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring dir = exe;
+    size_t pos = dir.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) dir = dir.substr(0, pos + 1);
+    return dir + L"cfg_" + name + L".ini";
+}
+static void ConfigSave() {
+    std::wstring name;
+    if (ShowInputBox(g_hwnd, L"nevada - by werty129129", L"Config name to SAVE:", L"default", name) && !name.empty()) {
+        SaveSettings(ConfigPath(name).c_str());
+    }
+}
+static void ConfigLoad() {
+    std::wstring name;
+    if (ShowInputBox(g_hwnd, L"nevada - by werty129129", L"Config name to LOAD:", L"default", name) && !name.empty()) {
+        std::wstring path = ConfigPath(name);
+        if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            g.bhopKey = IniGet(L"Bhop", L"Key", g.bhopKey.c_str(), path.c_str());
+            g.bhopDelay = std::clamp(IniGetInt(L"Bhop", L"Delay", g.bhopDelay, path.c_str()), 1, 100);
+            g.triggerKey = IniGet(L"Trigger", L"Key", g.triggerKey.c_str(), path.c_str());
+            g.shootKey = IniGet(L"Trigger", L"ShootKey", g.shootKey.c_str(), path.c_str());
+            g.threshold = std::clamp(IniGetInt(L"Trigger", L"Threshold", g.threshold, path.c_str()), 0, 255);
+            g.shootDelay = std::clamp(IniGetInt(L"Trigger", L"ShootDelay", g.shootDelay, path.c_str()), 1, 500);
+            g.theme = IniGet(L"Theme", L"Name", g.theme.c_str(), path.c_str());
+            ApplyTheme(g.theme);
+            SaveSettings(); 
+            InvalidateRect(g_hwnd, nullptr, TRUE);
+        }
+    }
+}
+static void ConfigDelete() {
+    std::wstring name;
+    if (ShowInputBox(g_hwnd, L"nevada - by werty129129", L"Config name to DELETE:", L"default", name) && !name.empty()) {
+        DeleteFileW(ConfigPath(name).c_str());
+    }
+}
+static void CycleTheme() {
+    const Theme* next = NextTheme(g_theme->name);
+    g.theme = next->name;
+    ApplyTheme(g.theme);
+    IniSet(L"Theme", L"Name", g.theme);
+    InvalidateRect(g_hwnd, nullptr, TRUE);
+}
+
+// ==================== ОКНО ====================
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE:
+        g_hwnd = hwnd;
+        g_fontTitle = CreateFontW(23, 0, 0, 0, FW_BOLD, TRUE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        g_font = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        g_fontSmall = CreateFontW(12, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        LoadSettings();
+        SaveDefaultsIfMissing();
+        InstallHooks();
+        SetTimer(hwnd, g_uiTimer, 35, nullptr);
+        return 0;
+
+    case WM_TIMER:
+        if (wp == g_uiTimer) InvalidateRect(hwnd, nullptr, FALSE);
+        else if (wp == g_bhopTimer) SendKeyTap(VK_SPACE);
+        return 0;
+
+    case WM_ERASEBKGND: return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps{}; HDC dc = BeginPaint(hwnd, &ps);
+        RECT r{}; GetClientRect(hwnd, &r);
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, r.right, r.bottom);
+        auto old = SelectObject(mem, bmp);
+        DrawUI(mem, r);
+        BitBlt(dc, 0, 0, r.right, r.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);
+        EndPaint(hwnd, &ps); return 0;
+    }
+
+    case WM_LBUTTONDOWN: {
+        int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+        if (y >= 16 && y <= 40 && x >= 300 && x <= 382) { CycleTheme(); return 0; }
+        if (y >= 116 && y <= 138 && x >= 30 && x <= 74) { g.bhopDelay = std::max(1, g.bhopDelay - 1); IniSetInt(L"Bhop", L"Delay", g.bhopDelay); }
+        else if (y >= 116 && y <= 138 && x >= 80 && x <= 124) { g.bhopDelay = std::min(100, g.bhopDelay + 1); IniSetInt(L"Bhop", L"Delay", g.bhopDelay); }
+        else if (y >= 114 && y <= 139 && x >= 246 && x <= 365) { ChangeBhopKey(); return 0; }
+        else if (y >= 182 && y <= 205 && x >= 163 && x <= 207) { g.threshold = std::max(0, g.threshold - 1); IniSetInt(L"Trigger", L"Threshold", g.threshold); }
+        else if (y >= 182 && y <= 205 && x >= 213 && x <= 257) { g.threshold = std::min(255, g.threshold + 1); IniSetInt(L"Trigger", L"Threshold", g.threshold); }
+        else if (y >= 206 && y <= 228 && x >= 246 && x <= 365) { ChangeTriggerKey(); return 0; }
+        else if (y >= 268 && y <= 290 && x >= 30 && x <= 104) { ConfigSave(); return 0; }
+        else if (y >= 268 && y <= 290 && x >= 112 && x <= 186) { ConfigLoad(); return 0; }
+        else if (y >= 268 && y <= 290 && x >= 194 && x <= 268) { ConfigDelete(); return 0; }
+        else if (y >= 302 && y <= 320 && x >= 18 && x <= 180) { ChangeShootKey(); return 0; }
+        else if (y >= 302 && y <= 320 && x >= 180 && x <= 382) { ChangeShootDelay(); return 0; }
+        InvalidateRect(hwnd, nullptr, TRUE); return 0;
+    }
+
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) { DestroyWindow(hwnd); return 0; }
+        break;
+
+    case WM_DESTROY:
+        UninstallHooks();
+        KillTimer(hwnd, g_uiTimer);
+        if (g_fontTitle) DeleteObject(g_fontTitle);
+        if (g_font)      DeleteObject(g_font);
+        if (g_fontSmall) DeleteObject(g_fontSmall);
+        PostQuitMessage(0); return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = inst;
+    wc.lpszClassName = kClassName;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    if (!RegisterClassW(&wc)) return 1;
+
+    HWND h = CreateWindowExW(0, kClassName, L"nevada - by werty129129",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        CW_USEDEFAULT, CW_USEDEFAULT, 410, 375, nullptr, nullptr, inst, nullptr);
+    if (!h) return 2;
+    ShowWindow(h, show); UpdateWindow(h);
+
+    MSG m{};
+    while (GetMessageW(&m, nullptr, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
+    return (int)m.wParam;
+}
