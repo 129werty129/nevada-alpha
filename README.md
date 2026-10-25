@@ -1,0 +1,1 @@
+This is not a RAT file; it contains no viruses. I created it in 3 days. The full code is provided below; it can be compiled using Visual Studio. I used to write scripts in AHK, but I got a bit tired of that, so I decided to try something new. This is my first project, so please dont judge it too harshly.
